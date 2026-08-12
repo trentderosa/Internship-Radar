@@ -1,0 +1,20 @@
+# Environment variables / secrets
+.env
+
+# Local database
+data/*.db
+data/*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# Streamlit
+.streamlit/
+
+# Editor / OS
+.vscode/
+.DS_Store
