@@ -25,9 +25,11 @@ from src.config import (
     HIGH_FIT_SCORE_THRESHOLD,
 )
 from src.collectors.sample_source import get_sample_jobs
+from src.collectors.board_apis import fetch_all_board_jobs
 from src.dedupe import dedupe_job_list
 from src.ranker import rank_job
 from src.urls import is_valid_url, link_status
+from src.refresh_state import save_refresh_state, load_refresh_state
 
 # ---------------------------------------------------------------------------
 # Page setup
@@ -360,11 +362,32 @@ def categorize_role(title: str, description: str = "") -> str:
 
 
 def run_refresh() -> tuple:
-    """Collect sample jobs, dedupe, save new ones, and score anything that
-    doesn't have a score yet. Returns (new_job_count, scored_count)."""
-    collected = get_sample_jobs()
-    collected = dedupe_job_list(collected)
-    new_count = db.upsert_jobs(collected)
+    """
+    Collect from every configured source, dedupe, save new postings, and
+    score anything that doesn't have a score yet.
+
+    Two sources feed the pipeline:
+      - sample_source: static illustrative postings, always available, no
+        network required. Useful the moment you first run the app, and as
+        a fallback if the live sources below are unreachable.
+      - board_apis: live postings pulled from each configured company's
+        real Greenhouse/Lever job board (src.config.BOARD_SOURCES). A bad
+        token or a network hiccup for one company is isolated there and
+        never stops the others from coming through.
+
+    Returns (new_job_count, scored_count, source_counts, board_stats) so the
+    UI can show exactly where new postings came from and surface anything
+    that needs attention (e.g. a stale board token).
+    """
+    sample_jobs = dedupe_job_list(get_sample_jobs())
+    board_jobs, board_stats = fetch_all_board_jobs()
+    board_jobs = dedupe_job_list(board_jobs)
+
+    source_counts = {
+        "sample_source": db.upsert_jobs(sample_jobs),
+        "board_api": db.upsert_jobs(board_jobs),
+    }
+    new_count = sum(source_counts.values())
 
     unscored = db.get_jobs_needing_score()
     for job in unscored:
@@ -376,7 +399,9 @@ def run_refresh() -> tuple:
             result.get("matched_skills", []),
         )
 
-    return new_count, len(unscored)
+    save_refresh_state(source_counts, board_stats)
+
+    return new_count, len(unscored), source_counts, board_stats
 
 
 def load_jobs() -> pd.DataFrame:
@@ -797,12 +822,32 @@ if page == "Dashboard":
     with top_col2:
         if st.button("Refresh Jobs", width='stretch'):
             with st.spinner("Collecting and scoring postings..."):
-                new_count, scored_count = run_refresh()
-            st.success(f"Added {new_count} new job(s). Scored {scored_count} job(s).")
+                new_count, scored_count, source_counts, board_stats = run_refresh()
+            board_errors = [s for s in board_stats if s["error"]]
+            st.success(
+                f"Added {new_count} new job(s) "
+                f"({source_counts.get('sample_source', 0)} sample, "
+                f"{source_counts.get('board_api', 0)} live). "
+                f"Scored {scored_count} job(s)."
+            )
+            if board_errors:
+                st.warning(
+                    f"{len(board_errors)} live source(s) couldn't be reached this "
+                    "time -- see Settings for details."
+                )
             jobs_df = load_jobs()
 
     st.markdown('<div class="ir-section-label">Overview</div>', unsafe_allow_html=True)
     render_metrics(jobs_df)
+
+    refresh_state = load_refresh_state()
+    if refresh_state.get("refreshed_at"):
+        counts = refresh_state.get("source_counts", {})
+        st.caption(
+            f"Last refreshed {refresh_state['refreshed_at']} · "
+            f"{counts.get('sample_source', 0)} from sample data, "
+            f"{counts.get('board_api', 0)} from live company boards."
+        )
 
     st.markdown('<hr class="ir-divider">', unsafe_allow_html=True)
     st.markdown('<div class="ir-section-label">Top Internship Matches</div>', unsafe_allow_html=True)
@@ -818,6 +863,20 @@ elif page == "All Internships":
     filtered_df = apply_filters(
         jobs_df, status_filter, min_score, search_text, category_filter, viewed_only, unviewed_only
     )
+
+    sort_col, _ = st.columns([1, 3])
+    with sort_col:
+        sort_choice = st.selectbox(
+            "Sort by",
+            options=["Best fit first", "Newest first", "Company A-Z"],
+        )
+    if not filtered_df.empty:
+        if sort_choice == "Best fit first":
+            filtered_df = filtered_df.sort_values("score", ascending=False, na_position="last")
+        elif sort_choice == "Newest first":
+            filtered_df = filtered_df.sort_values("discovered_at", ascending=False)
+        elif sort_choice == "Company A-Z":
+            filtered_df = filtered_df.sort_values("company", key=lambda s: s.str.lower())
 
     st.markdown('<div class="ir-section-label">All Postings</div>', unsafe_allow_html=True)
     render_all_internships_table(filtered_df)
@@ -891,6 +950,36 @@ elif page == "Settings":
         """,
         unsafe_allow_html=True,
     )
+
+    st.markdown('<div class="ir-section-label">Live Data Sources</div>', unsafe_allow_html=True)
+    refresh_state = load_refresh_state()
+    board_stats = refresh_state.get("board_stats", [])
+    if not board_stats:
+        st.markdown(
+            '<div class="ir-card">No refresh has run yet this session with live-source '
+            "data available. Click <strong>Refresh Jobs</strong> on the Dashboard to pull "
+            "from the configured company boards (see src/config.py: BOARD_SOURCES).</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        rows_html = ""
+        for stat in board_stats:
+            status_text = f"Error: {stat['error']}" if stat["error"] else f"{stat['found']} relevant posting(s)"
+            status_color = "var(--text-muted)" if stat["error"] else "var(--jmu-purple)"
+            rows_html += (
+                f'<div class="ir-kv-row"><span class="ir-kv-key">'
+                f'{stat["company"]} ({stat["board"]}, token: {stat["token"]})</span>'
+                f'<span class="ir-kv-val" style="color:{status_color}">{status_text}</span></div>'
+            )
+        st.markdown(f'<div class="ir-card">{rows_html}</div>', unsafe_allow_html=True)
+        error_count = sum(1 for s in board_stats if s["error"])
+        if error_count:
+            st.caption(
+                f"{error_count} board token(s) returned an error on the last refresh. "
+                "A company may have renamed its board, switched ATS providers, or been "
+                "temporarily unreachable -- update the token in src/config.py's "
+                "BOARD_SOURCES, or run scripts/verify_boards.py to check all of them at once."
+            )
 
     st.markdown('<div class="ir-section-label">How To Use This App</div>', unsafe_allow_html=True)
     st.markdown(

@@ -28,6 +28,7 @@ JOB_COLUMNS = [
     "url",
     "source",
     "description",
+    "posted_at",
     "discovered_at",
     "last_seen_at",
     "status",
@@ -49,6 +50,7 @@ _MIGRATION_COLUMNS = [
     ("viewed", "INTEGER NOT NULL DEFAULT 0"),
     ("viewed_at", "TEXT"),
     ("applied_at", "TEXT"),
+    ("posted_at", "TEXT"),
 ]
 
 
@@ -81,6 +83,7 @@ def init_db() -> None:
                 url            TEXT,
                 source         TEXT,
                 description    TEXT,
+                posted_at      TEXT,
                 discovered_at  TEXT NOT NULL,
                 last_seen_at   TEXT NOT NULL,
                 status         TEXT NOT NULL DEFAULT 'New',
@@ -188,10 +191,10 @@ def upsert_jobs(jobs: list) -> int:
                 """
                 INSERT INTO jobs (
                     company, title, location, url, source, description,
-                    discovered_at, last_seen_at, status, score,
+                    posted_at, discovered_at, last_seen_at, status, score,
                     ai_summary, matched_skills, notes,
                     viewed, viewed_at, applied_at, dedupe_key
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.get("company", "").strip(),
@@ -200,6 +203,7 @@ def upsert_jobs(jobs: list) -> int:
                     job.get("url", "").strip(),
                     job.get("source", "").strip(),
                     job.get("description", "").strip(),
+                    (job.get("posted_at") or "").strip(),
                     now,
                     now,
                     DEFAULT_STATUS,

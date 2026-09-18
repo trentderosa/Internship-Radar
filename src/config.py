@@ -137,3 +137,55 @@ COMPANY_CAREERS_URLS = {
     "palantir": "https://www.palantir.com/careers/",
     "greystone": "https://www.greystone.com/careers/",
 }
+
+# --- Location fit -----------------------------------------------------------
+# Substrings (case-insensitive) that mark a posting's location as a strong
+# geographic fit for the student's stated preferences (Northern Virginia /
+# DC metro, NYC, or remote). Used by the ranker as a scoring bonus and by the
+# UI to explain *why* a job scored the way it did.
+PREFERRED_LOCATION_KEYWORDS = [
+    "remote",
+    "washington, dc", "washington dc", "d.c.",
+    "arlington", "mclean", "vienna", "reston", "tysons", "fairfax",
+    "alexandria", "herndon", "chantilly", "northern virginia", "nova",
+    "new york",
+]
+
+# --- Real job board sources --------------------------------------------------
+# Curated list of companies whose public applicant-tracking-system job boards
+# are queried directly (no scraping/HTML parsing -- Greenhouse and Lever both
+# expose stable, unauthenticated JSON APIs for their public job boards).
+#
+# IMPORTANT: `token` is the identifier the company uses in its own board URL
+# (e.g. boards.greenhouse.io/<token> or jobs.lever.co/<token>), and it does
+# NOT always match the company's public brand name. These were set from
+# publicly known board URLs, but companies do rename/migrate ATS providers
+# over time, so a token can go stale. Run `python scripts/verify_boards.py`
+# (needs normal internet access) after pulling this to see which of these
+# currently resolve, and prune/replace any that don't -- see that script's
+# docstring for how to find a company's current token by hand.
+BOARD_SOURCES = [
+    {"company": "Stripe", "board": "greenhouse", "token": "stripe"},
+    {"company": "Airbnb", "board": "greenhouse", "token": "airbnb"},
+    {"company": "Robinhood", "board": "greenhouse", "token": "robinhood"},
+    {"company": "Coinbase", "board": "greenhouse", "token": "coinbase"},
+    {"company": "Databricks", "board": "greenhouse", "token": "databricks"},
+    {"company": "Snowflake", "board": "greenhouse", "token": "snowflake"},
+    {"company": "Asana", "board": "greenhouse", "token": "asana"},
+    {"company": "DoorDash", "board": "greenhouse", "token": "doordash"},
+    {"company": "Affirm", "board": "lever", "token": "affirm"},
+    {"company": "Plaid", "board": "lever", "token": "plaid"},
+    {"company": "Netflix", "board": "lever", "token": "netflix"},
+    {"company": "Rippling", "board": "lever", "token": "rippling"},
+]
+
+# Postings must look like an internship (title match) AND look relevant to
+# the student's target roles (title/description match) to be kept -- this
+# keeps a company's sales/marketing/legal internships out of the results.
+INTERNSHIP_TITLE_KEYWORDS = ["intern", "internship", "co-op", "coop"]
+RELEVANT_POSTING_KEYWORDS = [
+    "software", "engineer", "engineering", "developer", "dev ",
+    "data", "machine learning", "ml ", "ai ", "artificial intelligence",
+    "cloud", "devops", "infrastructure", "backend", "back-end", "full stack",
+    "full-stack", "security", "cyber", "platform", "systems", "technical",
+]

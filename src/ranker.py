@@ -15,12 +15,14 @@ OpenAI client directly.
 """
 
 import json
+import re
 
 from src.config import (
     OPENAI_API_KEY,
     OPENAI_MODEL,
     USER_PROFILE,
     FALLBACK_SKILL_KEYWORDS,
+    PREFERRED_LOCATION_KEYWORDS,
 )
 
 _client = None
@@ -33,22 +35,53 @@ if OPENAI_API_KEY:
         _client = None
 
 
+def _keyword_present(keyword: str, text: str) -> bool:
+    """
+    True if `keyword` appears in `text` as a whole word/phrase, not as a
+    substring of some longer word. Plain `keyword in text` matching has a
+    real bug here: "java" is a substring of "javascript", and "ai" is a
+    substring of ordinary words like "maintain", "domain", and "training",
+    so a posting with none of those skills would still rack up false
+    keyword hits and an inflated score. Bounding the match on both sides by
+    "not an alphanumeric character" (rather than regex \\b, which doesn't
+    play well with symbol-containing keywords like "c++" or "c#") fixes
+    both cases while still matching multi-word phrases like "machine
+    learning" correctly.
+    """
+    pattern = r"(?<![a-z0-9])" + re.escape(keyword) + r"(?![a-z0-9])"
+    return re.search(pattern, text) is not None
+
+
+def _location_is_preferred(location: str) -> bool:
+    loc = (location or "").lower()
+    return any(marker in loc for marker in PREFERRED_LOCATION_KEYWORDS)
+
+
 def _fallback_score(job: dict) -> dict:
     """Keyword-overlap scoring used when OpenAI isn't available."""
     text = f"{job.get('title', '')} {job.get('description', '')}".lower()
 
-    matched = [kw for kw in FALLBACK_SKILL_KEYWORDS if kw in text]
+    matched = [kw for kw in FALLBACK_SKILL_KEYWORDS if _keyword_present(kw, text)]
 
     # Simple, transparent formula: each matched keyword is worth a few
-    # points, capped at 100. Gives a reasonable spread without an API key.
-    score = min(100, len(matched) * 12)
+    # points, capped at 100 before the location bonus below. Gives a
+    # reasonable spread without an API key.
+    base_score = min(100, len(matched) * 12)
+
+    # Small bonus for postings in a location the student actually said they
+    # prefer (Northern VA/DC metro, NYC, or remote) -- two otherwise-tied
+    # postings shouldn't score identically if one is a much better logistical
+    # fit. Capped so it can push a good-but-not-maxed score up, never used to
+    # manufacture a high score out of a skill-less posting.
+    location_bonus = 8 if _location_is_preferred(job.get("location", "")) else 0
+    score = min(100, base_score + location_bonus)
 
     if matched:
-        summary = (
-            "Fallback keyword match on: " + ", ".join(matched[:6]) + "."
-        )
+        summary = "Fallback keyword match on: " + ", ".join(matched[:6]) + "."
     else:
         summary = "No strong keyword overlap found with your profile."
+    if location_bonus:
+        summary += " Location matches your stated preference."
 
     return {"score": score, "summary": summary, "matched_skills": matched}
 
