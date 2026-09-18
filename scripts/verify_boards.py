@@ -39,13 +39,14 @@ def main() -> int:
     broken = []
 
     for source in BOARD_SOURCES:
-        jobs, error = fetch_company_jobs(source)
+        jobs, error, excluded_season = fetch_company_jobs(source)
         label = f"{source['company']:<20} {source['board']:<10} token={source['token']}"
         if error:
             print(f"[BROKEN] {label} -- {error}")
             broken.append(source["company"])
         else:
-            print(f"[ok]     {label} -- {len(jobs)} relevant posting(s)")
+            extra = f" (+{excluded_season} excluded for wrong season)" if excluded_season else ""
+            print(f"[ok]     {label} -- {len(jobs)} relevant posting(s){extra}")
 
     print()
     if broken:

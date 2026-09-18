@@ -16,12 +16,17 @@ confirmed live posting. A future real collector should set `url` to the
 exact posting link it scrapes.
 """
 
+from src.season import classify_season
 from src.urls import get_company_careers_url
 
 SOURCE_NAME = "sample_source"
 
 
 def _job(company: str, title: str, location: str, description: str) -> dict:
+    # Sample jobs go through the same season classifier as live postings --
+    # a handful intentionally have no year in the title so the UI's "Season
+    # unconfirmed" label/filter has something realistic to show even before
+    # any live sources are pulled in.
     return {
         "company": company,
         "title": title,
@@ -29,6 +34,7 @@ def _job(company: str, title: str, location: str, description: str) -> dict:
         "url": get_company_careers_url(company),
         "source": SOURCE_NAME,
         "description": description,
+        "season_status": classify_season(title, description),
     }
 
 

@@ -4,6 +4,7 @@
 # Local database
 data/*.db
 data/*.sqlite3
+data/last_refresh.json
 
 # Python
 __pycache__/
@@ -11,6 +12,10 @@ __pycache__/
 .venv/
 venv/
 env/
+.pytest_cache/
+
+# Git bundles (build artifacts, not source)
+*.bundle
 
 # Streamlit
 .streamlit/

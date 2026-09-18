@@ -121,6 +121,21 @@ PLACEHOLDER_URL_MARKERS = [
     "company.com",
 ]
 
+# Query-string parameters known to be tracking/attribution noise (added by
+# email campaigns, social shares, job-board referral links, etc.) rather
+# than part of what identifies a specific posting. Stripped during URL
+# normalization for dedupe -- see src.dedupe.normalize_url. Deliberately a
+# denylist, not an allowlist: a param we've never seen before (e.g. a
+# Greenhouse `gh_jid` or Lever job id embedded in the query string) is kept
+# by default so two genuinely different postings never collapse into one
+# just because of an unfamiliar param name.
+TRACKING_QUERY_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "utm_id", "gh_src", "gh_jobboard", "gh_medium", "lever-source",
+    "lever-origin", "ref", "referrer", "source", "src", "fbclid", "gclid",
+    "msclkid", "mc_cid", "mc_eid", "trk", "li_fat_id",
+}
+
 # Known-good top-level careers pages, keyed by normalized company name
 # (see src.dedupe.normalize_text). Used to (a) populate sample job URLs with
 # real, working links instead of guessed posting paths, and (b) repair any
@@ -164,28 +179,70 @@ PREFERRED_LOCATION_KEYWORDS = [
 # (needs normal internet access) after pulling this to see which of these
 # currently resolve, and prune/replace any that don't -- see that script's
 # docstring for how to find a company's current token by hand.
+#
+# Last verified live against the real boards-api.greenhouse.io / api.lever.co
+# endpoints on 2026-09-18. Six of the original twelve tokens had gone stale
+# (404): Snowflake, DoorDash, Affirm, Plaid, Netflix, and Rippling. DoorDash
+# and Affirm were recovered with corrected tokens ("doordashusa", and a move
+# from Lever to Greenhouse under the same "affirm" token, both confirmed by
+# the API's own `company_name` field and a live redirect from
+# boards.greenhouse.io/<token>). Snowflake, Plaid, Netflix, and Rippling no
+# longer expose a public Greenhouse/Lever board at all (they've moved to an
+# ATS this collector doesn't support, e.g. Workday) and were replaced with
+# Lyft, Dropbox, Figma, and Scale AI -- all confirmed live with real Summer
+# 2027 software/data internship postings at verification time.
 BOARD_SOURCES = [
     {"company": "Stripe", "board": "greenhouse", "token": "stripe"},
     {"company": "Airbnb", "board": "greenhouse", "token": "airbnb"},
     {"company": "Robinhood", "board": "greenhouse", "token": "robinhood"},
     {"company": "Coinbase", "board": "greenhouse", "token": "coinbase"},
     {"company": "Databricks", "board": "greenhouse", "token": "databricks"},
-    {"company": "Snowflake", "board": "greenhouse", "token": "snowflake"},
+    {"company": "Lyft", "board": "greenhouse", "token": "lyft"},
     {"company": "Asana", "board": "greenhouse", "token": "asana"},
-    {"company": "DoorDash", "board": "greenhouse", "token": "doordash"},
-    {"company": "Affirm", "board": "lever", "token": "affirm"},
-    {"company": "Plaid", "board": "lever", "token": "plaid"},
-    {"company": "Netflix", "board": "lever", "token": "netflix"},
-    {"company": "Rippling", "board": "lever", "token": "rippling"},
+    {"company": "DoorDash", "board": "greenhouse", "token": "doordashusa"},
+    {"company": "Affirm", "board": "greenhouse", "token": "affirm"},
+    {"company": "Dropbox", "board": "greenhouse", "token": "dropbox"},
+    {"company": "Figma", "board": "greenhouse", "token": "figma"},
+    {"company": "Scale AI", "board": "greenhouse", "token": "scaleai"},
 ]
 
-# Postings must look like an internship (title match) AND look relevant to
-# the student's target roles (title/description match) to be kept -- this
-# keeps a company's sales/marketing/legal internships out of the results.
-INTERNSHIP_TITLE_KEYWORDS = ["intern", "internship", "co-op", "coop"]
+# Postings must look like an internship/co-op (title match, checked as
+# whole words -- see src.text_match) AND look relevant to the student's
+# target roles (title/description match) AND NOT look like an unrelated
+# sales/marketing/legal/HR role (title match) to be kept.
+#
+# Title is the primary evidence for "is this actually an internship" --
+# real ATS postings almost always say "Intern"/"Internship"/"Co-op" in the
+# title itself, and requiring it there (rather than allowing an incidental
+# mention buried in the description, e.g. "you'll work alongside our
+# summer interns") is what keeps a full-time role from being misclassified
+# just because its description happens to reference interns.
+#
+# All matching here uses whole-word boundaries (src.text_match), not plain
+# substring checks -- plain substring matching on "intern" was the actual
+# root cause of real false positives observed when this list was checked
+# against live Greenhouse data: "Internal Tools Engineer", "Director,
+# International Tax", and "Database Internals" all contain "intern" as a
+# substring but are not internships.
+INTERNSHIP_TITLE_KEYWORDS = ["intern", "interns", "internship", "internships", "co-op", "coop"]
+
+# Title keywords that mark a posting as an unrelated role even if it's a
+# genuine internship and even if its description happens to mention
+# software/engineering teams (e.g. a "Sales Development Intern" whose blurb
+# says "partner closely with our engineering team"). Checked against the
+# title only, and takes priority over RELEVANT_POSTING_KEYWORDS below.
+EXCLUDED_TITLE_KEYWORDS = [
+    "sales", "account executive", "account manager", "account development",
+    "business development", "marketing", "communications", "public relations",
+    "legal", "paralegal", "attorney", "counsel", "human resources",
+    "recruiting", "recruiter", "talent acquisition", "people operations",
+    "finance intern", "accounting intern", "audit", "procurement",
+    "supply chain", "merchandising", "retail", "hospitality",
+]
+
 RELEVANT_POSTING_KEYWORDS = [
-    "software", "engineer", "engineering", "developer", "dev ",
-    "data", "machine learning", "ml ", "ai ", "artificial intelligence",
+    "software", "engineer", "engineering", "developer", "dev",
+    "data", "machine learning", "ml", "ai", "artificial intelligence",
     "cloud", "devops", "infrastructure", "backend", "back-end", "full stack",
     "full-stack", "security", "cyber", "platform", "systems", "technical",
 ]

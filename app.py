@@ -24,10 +24,11 @@ from src.config import (
     ROLE_CATEGORY_KEYWORDS,
     HIGH_FIT_SCORE_THRESHOLD,
 )
-from src.collectors.sample_source import get_sample_jobs
+from src.collectors.sample_source import get_sample_jobs, SOURCE_NAME as SAMPLE_SOURCE_NAME
 from src.collectors.board_apis import fetch_all_board_jobs
 from src.dedupe import dedupe_job_list
 from src.ranker import rank_job
+from src.season import season_label
 from src.urls import is_valid_url, link_status
 from src.refresh_state import save_refresh_state, load_refresh_state
 
@@ -314,6 +315,11 @@ a:hover, .ir-card a:hover {
     border-color: var(--jmu-gold);
     color: var(--text-charcoal);
 }
+.ir-badge-demo {
+    background-color: var(--bg-offwhite);
+    border-color: var(--jmu-purple);
+    color: var(--jmu-purple);
+}
 
 /* Dataframe / table tightening */
 [data-testid="stDataFrame"] {
@@ -361,32 +367,36 @@ def categorize_role(title: str, description: str = "") -> str:
     return "Other"
 
 
-def run_refresh() -> tuple:
+def run_refresh(include_sample: bool = False) -> tuple:
     """
     Collect from every configured source, dedupe, save new postings, and
     score anything that doesn't have a score yet.
 
-    Two sources feed the pipeline:
-      - sample_source: static illustrative postings, always available, no
-        network required. Useful the moment you first run the app, and as
-        a fallback if the live sources below are unreachable.
+    Two possible sources feed the pipeline:
       - board_apis: live postings pulled from each configured company's
         real Greenhouse/Lever job board (src.config.BOARD_SOURCES). A bad
         token or a network hiccup for one company is isolated there and
-        never stops the others from coming through.
+        never stops the others from coming through. This is the default,
+        real-postings experience.
+      - sample_source: static illustrative postings, no network required.
+        Explicitly opt-in (include_sample=True) -- these are demonstration
+        data, not real live postings, and should never be mistaken for
+        real search results by default.
 
     Returns (new_job_count, scored_count, source_counts, board_stats) so the
     UI can show exactly where new postings came from and surface anything
     that needs attention (e.g. a stale board token).
     """
-    sample_jobs = dedupe_job_list(get_sample_jobs())
     board_jobs, board_stats = fetch_all_board_jobs()
     board_jobs = dedupe_job_list(board_jobs)
+    source_counts = {"board_api": db.upsert_jobs(board_jobs)}
 
-    source_counts = {
-        "sample_source": db.upsert_jobs(sample_jobs),
-        "board_api": db.upsert_jobs(board_jobs),
-    }
+    if include_sample:
+        sample_jobs = dedupe_job_list(get_sample_jobs())
+        source_counts["sample_source"] = db.upsert_jobs(sample_jobs)
+    else:
+        source_counts["sample_source"] = 0
+
     new_count = sum(source_counts.values())
 
     unscored = db.get_jobs_needing_score()
@@ -404,18 +414,30 @@ def run_refresh() -> tuple:
     return new_count, len(unscored), source_counts, board_stats
 
 
-def load_jobs() -> pd.DataFrame:
-    """Load every job straight from SQLite (no caching -- this is a small
-    local dataset, and a stale cache is worse than an extra query)."""
+def load_jobs(include_sample: bool = False) -> pd.DataFrame:
+    """
+    Load every job straight from SQLite (no caching -- this is a small
+    local dataset, and a stale cache is worse than an extra query).
+
+    Sample/demo rows (source == "sample_source") are excluded by default --
+    see the "Include sample/demo data" toggle in the sidebar -- so the main
+    experience is always real postings unless a user explicitly opts in.
+    Sample rows are never deleted, only hidden from the default view.
+    """
     df = db.get_all_jobs_df()
     if df.empty:
         return df
     df = df.copy()
+    if not include_sample:
+        df = df[df["source"] != SAMPLE_SOURCE_NAME].copy()
+    if df.empty:
+        return df
     df["role_category"] = df.apply(
         lambda row: categorize_role(row.get("title", ""), row.get("description", "")),
         axis=1,
     )
     df["is_viewed"] = (df["viewed"] == 1) | (df["status"] == "Viewed")
+    df["season_display"] = df["season_status"].apply(season_label)
     return df
 
 
@@ -446,12 +468,18 @@ def render_metrics(df: pd.DataFrame) -> None:
     st.markdown(cards_html, unsafe_allow_html=True)
 
 
+SEASON_FILTER_OPTIONS = [f"Summer {2027}", "Season unconfirmed"]
+SOURCE_FILTER_LABELS = {"board_api": "Live company boards", "sample_source": "Sample / demo data"}
+
+
 def apply_filters(
     df: pd.DataFrame,
     status_filter,
     min_score,
     search_text,
     category_filter,
+    season_filter=None,
+    source_filter=None,
     viewed_only: bool = False,
     unviewed_only: bool = False,
 ) -> pd.DataFrame:
@@ -467,6 +495,13 @@ def apply_filters(
 
     if category_filter and "All" not in category_filter:
         filtered = filtered[filtered["role_category"].isin(category_filter)]
+
+    if season_filter and "All" not in season_filter:
+        filtered = filtered[filtered["season_display"].isin(season_filter)]
+
+    if source_filter and "All" not in source_filter:
+        source_values = [k for k, v in SOURCE_FILTER_LABELS.items() if v in source_filter]
+        filtered = filtered[filtered["source"].isin(source_values)]
 
     if viewed_only:
         filtered = filtered[filtered["is_viewed"]]
@@ -502,13 +537,34 @@ def render_filters(df: pd.DataFrame) -> tuple:
             "Role category", options=["All"] + ROLE_CATEGORIES, default=["All"]
         )
 
-    v1, v2, _ = st.columns([1, 1, 2.4])
+    f5, f6, v1, v2 = st.columns([1.2, 1.4, 1, 1])
+    with f5:
+        season_filter = st.multiselect(
+            "Season",
+            options=["All"] + SEASON_FILTER_OPTIONS,
+            default=["All"],
+            help='"Season unconfirmed" postings never had a season/year stated -- we never '
+            "invent one, so they're kept but flagged as unconfirmed rather than dropped.",
+        )
+    with f6:
+        source_filter = st.multiselect(
+            "Source",
+            options=["All"] + list(SOURCE_FILTER_LABELS.values()),
+            default=["All"],
+        )
     with v1:
         viewed_only = st.checkbox("Viewed only")
     with v2:
         unviewed_only = st.checkbox("Unviewed only")
 
-    return status_filter, min_score, search_text, category_filter, viewed_only, unviewed_only
+    return (
+        status_filter, min_score, search_text, category_filter,
+        season_filter, source_filter, viewed_only, unviewed_only,
+    )
+
+
+def _demo_badge_html() -> str:
+    return '<span class="ir-badge ir-badge-demo">Sample / Demo</span>'
 
 
 def _score_badge_html(score) -> str:
@@ -544,7 +600,9 @@ def render_job_cards(df: pd.DataFrame, key_prefix: str) -> None:
             st.markdown(
                 _score_badge_html(row["score"])
                 + f'<span class="ir-badge">{row["status"]}</span>'
-                + ('<span class="ir-badge">Viewed</span>' if row["is_viewed"] else ""),
+                + ('<span class="ir-badge">Viewed</span>' if row["is_viewed"] else "")
+                + f'<span class="ir-badge">{row["season_display"]}</span>'
+                + (_demo_badge_html() if row["source"] == SAMPLE_SOURCE_NAME else ""),
                 unsafe_allow_html=True,
             )
             if row.get("ai_summary"):
@@ -588,6 +646,10 @@ def render_all_internships_table(df: pd.DataFrame) -> None:
     display_df["Link Status"] = display_df.apply(
         lambda r: link_status(r["url"], r["source"]), axis=1
     )
+    display_df["Data Type"] = display_df["source"].map(
+        lambda s: "Sample / Demo" if s == SAMPLE_SOURCE_NAME else "Live"
+    )
+    display_df["Posted"] = display_df["posted_at"].fillna("").str.slice(0, 10)
     # Only a genuinely valid URL is allowed into the link column -- anything
     # else (blank, or a placeholder like ".../404") becomes None so it
     # renders as an empty, non-clickable cell instead of a fake/broken link.
@@ -597,8 +659,9 @@ def render_all_internships_table(df: pd.DataFrame) -> None:
 
     display_df = display_df[
         [
-            "company", "title", "location", "score", "status", "ai_summary",
-            "source", "Application URL", "Link Status", "Viewed", "Notes Preview",
+            "company", "title", "location", "score", "status", "season_display",
+            "Data Type", "Posted", "ai_summary", "source", "Application URL",
+            "Link Status", "Viewed", "Notes Preview",
         ]
     ].rename(
         columns={
@@ -607,6 +670,7 @@ def render_all_internships_table(df: pd.DataFrame) -> None:
             "location": "Location",
             "score": "Score",
             "status": "Status",
+            "season_display": "Season",
             "ai_summary": "AI Summary",
             "source": "Source",
         }
@@ -716,6 +780,10 @@ def render_job_detail_editor(df: pd.DataFrame, key_suffix: str, allowed_statuses
         with col1:
             st.markdown(f"**{job_row['title']}**")
             st.markdown(f"{job_row['company']} · {job_row['location']} · Source: {job_row['source']}")
+            badges = f'<span class="ir-badge">{job_row["season_display"]}</span>'
+            if job_row["source"] == SAMPLE_SOURCE_NAME:
+                badges += _demo_badge_html()
+            st.markdown(badges, unsafe_allow_html=True)
             if job_row.get("ai_summary"):
                 st.markdown(f"_{job_row['ai_summary']}_")
             if job_row.get("matched_skills"):
@@ -728,9 +796,18 @@ def render_job_detail_editor(df: pd.DataFrame, key_suffix: str, allowed_statuses
             score_display = job_row["score"] if pd.notna(job_row["score"]) else "—"
             applied_display = str(job_row.get("applied_at") or "—")[:10]
             viewed_display = str(job_row.get("viewed_at") or "—")[:10]
+            posted_display = str(job_row.get("posted_at") or "—")[:10]
+            discovered_display = str(job_row.get("discovered_at") or "—")[:10]
+            last_seen_display = str(job_row.get("last_seen_at") or "—")[:10]
             st.markdown(
                 f'<div class="ir-kv-row"><span class="ir-kv-key">Score</span>'
                 f'<span class="ir-kv-val">{score_display}</span></div>'
+                f'<div class="ir-kv-row"><span class="ir-kv-key">Posted</span>'
+                f'<span class="ir-kv-val">{posted_display}</span></div>'
+                f'<div class="ir-kv-row"><span class="ir-kv-key">Discovered</span>'
+                f'<span class="ir-kv-val">{discovered_display}</span></div>'
+                f'<div class="ir-kv-row"><span class="ir-kv-key">Last Seen</span>'
+                f'<span class="ir-kv-val">{last_seen_display}</span></div>'
                 f'<div class="ir-kv-row"><span class="ir-kv-key">Viewed</span>'
                 f'<span class="ir-kv-val">{viewed_display}</span></div>'
                 f'<div class="ir-kv-row"><span class="ir-kv-key">Applied</span>'
@@ -777,6 +854,17 @@ st.sidebar.markdown(
     unsafe_allow_html=True,
 )
 
+st.sidebar.markdown('<hr class="ir-divider">', unsafe_allow_html=True)
+st.sidebar.markdown('<div class="ir-section-label">Data</div>', unsafe_allow_html=True)
+include_sample_data = st.sidebar.checkbox(
+    "Include sample / demo data",
+    value=st.session_state.get("include_sample_data", False),
+    key="include_sample_data",
+    help="Illustrative example postings, not real live listings. Off by default so the "
+    "app always defaults to real postings; turning this on also pulls sample data into "
+    "the next Refresh Jobs run.",
+)
+
 # Opening a job's detail editor marks it viewed. The relevant selectbox key
 # already holds the newly-selected id (Streamlit updates session_state
 # before rerunning), so applying this before loading jobs_df lets metrics
@@ -810,7 +898,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-jobs_df = load_jobs()
+jobs_df = load_jobs(include_sample=include_sample_data)
 
 
 # ---------------------------------------------------------------------------
@@ -822,20 +910,35 @@ if page == "Dashboard":
     with top_col2:
         if st.button("Refresh Jobs", width='stretch'):
             with st.spinner("Collecting and scoring postings..."):
-                new_count, scored_count, source_counts, board_stats = run_refresh()
+                new_count, scored_count, source_counts, board_stats = run_refresh(
+                    include_sample=include_sample_data
+                )
             board_errors = [s for s in board_stats if s["error"]]
+            board_ok = [s for s in board_stats if not s["error"]]
+            excluded_season_total = sum(s.get("excluded_season", 0) for s in board_ok)
+            sample_note = (
+                f", {source_counts.get('sample_source', 0)} sample/demo"
+                if include_sample_data
+                else ""
+            )
             st.success(
                 f"Added {new_count} new job(s) "
-                f"({source_counts.get('sample_source', 0)} sample, "
-                f"{source_counts.get('board_api', 0)} live). "
+                f"({source_counts.get('board_api', 0)} live{sample_note}). "
                 f"Scored {scored_count} job(s)."
             )
+            if excluded_season_total:
+                st.caption(
+                    f"{excluded_season_total} otherwise-relevant posting(s) were filtered "
+                    "out for naming a season/year other than Summer 2027."
+                )
             if board_errors:
                 st.warning(
-                    f"{len(board_errors)} live source(s) couldn't be reached this "
-                    "time -- see Settings for details."
+                    f"{len(board_errors)} of {len(board_stats)} live source(s) couldn't be "
+                    "reached this time (network error or a stale board token) -- see "
+                    "Settings for exactly which ones and why. Their postings were skipped, "
+                    "not shown as zero results."
                 )
-            jobs_df = load_jobs()
+            jobs_df = load_jobs(include_sample=include_sample_data)
 
     st.markdown('<div class="ir-section-label">Overview</div>', unsafe_allow_html=True)
     render_metrics(jobs_df)
@@ -845,9 +948,11 @@ if page == "Dashboard":
         counts = refresh_state.get("source_counts", {})
         st.caption(
             f"Last refreshed {refresh_state['refreshed_at']} · "
-            f"{counts.get('sample_source', 0)} from sample data, "
-            f"{counts.get('board_api', 0)} from live company boards."
+            f"{counts.get('board_api', 0)} from live company boards, "
+            f"{counts.get('sample_source', 0)} from sample data."
         )
+    if not include_sample_data:
+        st.caption("Sample/demo data is hidden. Turn it on from the sidebar to include it.")
 
     st.markdown('<hr class="ir-divider">', unsafe_allow_html=True)
     st.markdown('<div class="ir-section-label">Top Internship Matches</div>', unsafe_allow_html=True)
@@ -859,21 +964,35 @@ if page == "Dashboard":
 # ---------------------------------------------------------------------------
 
 elif page == "All Internships":
-    status_filter, min_score, search_text, category_filter, viewed_only, unviewed_only = render_filters(jobs_df)
+    (
+        status_filter, min_score, search_text, category_filter,
+        season_filter, source_filter, viewed_only, unviewed_only,
+    ) = render_filters(jobs_df)
     filtered_df = apply_filters(
-        jobs_df, status_filter, min_score, search_text, category_filter, viewed_only, unviewed_only
+        jobs_df, status_filter, min_score, search_text, category_filter,
+        season_filter, source_filter, viewed_only, unviewed_only,
     )
 
     sort_col, _ = st.columns([1, 3])
     with sort_col:
         sort_choice = st.selectbox(
             "Sort by",
-            options=["Best fit first", "Newest first", "Company A-Z"],
+            options=[
+                "Best fit first",
+                "Recently posted first",
+                "Recently discovered first",
+                "Company A-Z",
+            ],
+            help="\"Recently posted\" uses the source's original publication date (blank for "
+            "postings that don't provide one). \"Recently discovered\" uses when this app "
+            "first found the posting.",
         )
     if not filtered_df.empty:
         if sort_choice == "Best fit first":
             filtered_df = filtered_df.sort_values("score", ascending=False, na_position="last")
-        elif sort_choice == "Newest first":
+        elif sort_choice == "Recently posted first":
+            filtered_df = filtered_df.sort_values("posted_at", ascending=False, na_position="last")
+        elif sort_choice == "Recently discovered first":
             filtered_df = filtered_df.sort_values("discovered_at", ascending=False)
         elif sort_choice == "Company A-Z":
             filtered_df = filtered_df.sort_values("company", key=lambda s: s.str.lower())
@@ -934,7 +1053,11 @@ elif page == "Viewed Jobs":
 elif page == "Settings":
     st.markdown('<div class="ir-section-label">Configuration</div>', unsafe_allow_html=True)
 
-    total_jobs = len(jobs_df)
+    all_jobs_df = db.get_all_jobs_df()
+    total_jobs = len(all_jobs_df)
+    sample_jobs_count = (
+        int((all_jobs_df["source"] == SAMPLE_SOURCE_NAME).sum()) if not all_jobs_df.empty else 0
+    )
     key_status = "Detected" if OPENAI_API_KEY else "Not set (using keyword fallback scoring)"
     scoring_mode = "OpenAI" if OPENAI_API_KEY else "Keyword fallback"
 
@@ -946,6 +1069,7 @@ elif page == "Settings":
             <div class="ir-kv-row"><span class="ir-kv-key">OpenAI Model</span><span class="ir-kv-val">{OPENAI_MODEL}</span></div>
             <div class="ir-kv-row"><span class="ir-kv-key">Database File</span><span class="ir-kv-val">{DB_PATH}</span></div>
             <div class="ir-kv-row"><span class="ir-kv-key">Total Jobs Stored</span><span class="ir-kv-val">{total_jobs}</span></div>
+            <div class="ir-kv-row"><span class="ir-kv-key">Sample / Demo Jobs Stored</span><span class="ir-kv-val">{sample_jobs_count} (hidden from the app unless "Include sample / demo data" is checked)</span></div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -964,8 +1088,13 @@ elif page == "Settings":
     else:
         rows_html = ""
         for stat in board_stats:
-            status_text = f"Error: {stat['error']}" if stat["error"] else f"{stat['found']} relevant posting(s)"
-            status_color = "var(--text-muted)" if stat["error"] else "var(--jmu-purple)"
+            if stat["error"]:
+                status_text = f"Unavailable -- {stat['error']}"
+                status_color = "#B3261E"
+            else:
+                extra = f" ({stat['excluded_season']} filtered for wrong season)" if stat.get("excluded_season") else ""
+                status_text = f"{stat['found']} relevant posting(s){extra}"
+                status_color = "var(--jmu-purple)"
             rows_html += (
                 f'<div class="ir-kv-row"><span class="ir-kv-key">'
                 f'{stat["company"]} ({stat["board"]}, token: {stat["token"]})</span>'
@@ -975,10 +1104,12 @@ elif page == "Settings":
         error_count = sum(1 for s in board_stats if s["error"])
         if error_count:
             st.caption(
-                f"{error_count} board token(s) returned an error on the last refresh. "
-                "A company may have renamed its board, switched ATS providers, or been "
+                f"{error_count} of {len(board_stats)} board source(s) were unavailable on the "
+                "last refresh (shown in red above, not counted as a zero-result success). A "
+                "company may have renamed its board, switched ATS providers, or been "
                 "temporarily unreachable -- update the token in src/config.py's "
-                "BOARD_SOURCES, or run scripts/verify_boards.py to check all of them at once."
+                "BOARD_SOURCES, or run `python scripts/verify_boards.py` to check all of them "
+                "at once against their real public endpoints."
             )
 
     st.markdown('<div class="ir-section-label">How To Use This App</div>', unsafe_allow_html=True)
@@ -995,7 +1126,11 @@ elif page == "Settings":
         <em>Applied</em> stamps an applied date the first time it happens.
         Set <code>OPENAI_API_KEY</code> in a <code>.env</code> file to enable AI-based scoring;
         without it, the app scores jobs using a transparent keyword fallback so it always
-        remains usable.
+        remains usable. The default experience shows only real postings from live company
+        boards -- check <strong>Include sample / demo data</strong> in the sidebar to also see
+        illustrative example postings (always clearly marked <em>Sample / Demo</em>). Postings
+        with no stated season/year are kept and labeled <strong>Season unconfirmed</strong>
+        rather than guessed at -- use the Season filter on All Internships to show or hide them.
         </div>
         """,
         unsafe_allow_html=True,

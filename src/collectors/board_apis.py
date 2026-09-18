@@ -19,12 +19,22 @@ Design goals:
   take down the whole refresh -- every network call is isolated and fails
   soft (logged in the returned stats, not raised).
 - Only postings that actually look like a relevant internship are kept
-  (see src.config.INTERNSHIP_TITLE_KEYWORDS / RELEVANT_POSTING_KEYWORDS) --
-  a company's sales/legal/marketing internships are filtered out here so
-  they never reach the dashboard or get scored.
-- Output shape matches src.collectors.sample_source exactly (company,
-  title, location, url, source, description, plus an optional
-  posted_at), so app.py can treat every source identically.
+  (see src.config.INTERNSHIP_TITLE_KEYWORDS / EXCLUDED_TITLE_KEYWORDS /
+  RELEVANT_POSTING_KEYWORDS) -- a company's sales/legal/marketing
+  internships are filtered out here so they never reach the dashboard or
+  get scored, and postings explicitly for a season/year other than Summer
+  2027 are filtered out too (see src.season).
+- Output shape matches src.collectors.sample_source, plus `source_updated_at`
+  and `season_status` (company, title, location, url, source, description,
+  posted_at, source_updated_at, season_status), so app.py/db.py can treat
+  every source identically.
+- posted_at is only ever set from a field that represents genuine original
+  publication (Lever's `createdAt`, or Greenhouse's `first_published` when
+  the board provides it) -- Greenhouse's `updated_at` reflects the last
+  time the posting's *listing* changed (which can be nothing more than a
+  metadata edit) and is never used as a publication date. It's kept
+  separately as source_updated_at so the UI can be honest about which date
+  is which.
 """
 
 import re
@@ -34,10 +44,12 @@ import requests
 
 from src.config import (
     BOARD_SOURCES,
+    EXCLUDED_TITLE_KEYWORDS,
     INTERNSHIP_TITLE_KEYWORDS,
     RELEVANT_POSTING_KEYWORDS,
 )
-from src.dedupe import normalize_text
+from src.season import classify_season
+from src.text_match import any_keyword_present
 
 SOURCE_NAME = "board_api"
 REQUEST_TIMEOUT_SECONDS = 10
@@ -59,11 +71,22 @@ def _strip_html(html_text: str) -> str:
 
 
 def _looks_like_relevant_internship(title: str, description: str = "") -> bool:
-    text = f" {title} {description} ".lower()
-    is_internship = any(kw in text for kw in INTERNSHIP_TITLE_KEYWORDS)
-    if not is_internship:
+    """
+    Title is the primary (and for the internship/exclusion checks, the
+    *only*) evidence -- see the INTERNSHIP_TITLE_KEYWORDS docstring in
+    src/config.py for why. All matching is whole-word (src.text_match), so
+    "Internal Tools Engineer" and "Director, International Tax" -- both
+    real postings seen on live boards during development -- correctly fail
+    the internship check instead of matching "intern" as a substring.
+    """
+    title_lower = (title or "").lower()
+    if not any_keyword_present(INTERNSHIP_TITLE_KEYWORDS, title_lower):
         return False
-    return any(kw in text for kw in RELEVANT_POSTING_KEYWORDS)
+    if any_keyword_present(EXCLUDED_TITLE_KEYWORDS, title_lower):
+        return False
+
+    text = f"{title_lower} {(description or '').lower()}"
+    return any_keyword_present(RELEVANT_POSTING_KEYWORDS, text)
 
 
 def _epoch_ms_to_iso(value) -> str:
@@ -89,6 +112,11 @@ def _parse_greenhouse_job(raw: dict, company_display_name: str) -> dict:
     title = raw.get("title", "") or ""
     location = (raw.get("location") or {}).get("name", "") or ""
     description = _strip_html(raw.get("content", ""))
+    # Some Greenhouse boards include a genuine "first_published" timestamp
+    # in the jobs list response -- when present, that's a real publication
+    # date. `updated_at` is NOT a publication date (it moves any time the
+    # listing is edited) and must never be used for posted_at.
+    posted_at = raw.get("first_published", "") or ""
     return {
         "company": company_display_name,
         "title": title,
@@ -96,7 +124,8 @@ def _parse_greenhouse_job(raw: dict, company_display_name: str) -> dict:
         "url": raw.get("absolute_url", "") or "",
         "source": SOURCE_NAME,
         "description": description,
-        "posted_at": raw.get("updated_at", "") or "",
+        "posted_at": posted_at,
+        "source_updated_at": raw.get("updated_at", "") or "",
     }
 
 
@@ -120,16 +149,22 @@ def _parse_lever_posting(raw: dict, company_display_name: str) -> dict:
         "url": raw.get("hostedUrl", "") or "",
         "source": SOURCE_NAME,
         "description": description,
+        # Lever's createdAt genuinely is when the posting was created.
         "posted_at": _epoch_ms_to_iso(raw.get("createdAt")),
+        "source_updated_at": _epoch_ms_to_iso(raw.get("updatedAt")),
     }
 
 
 def fetch_company_jobs(source_config: dict) -> tuple:
     """
     Fetch and filter postings for a single company. Returns
-    (jobs, error_message). error_message is None on success (even if zero
-    relevant postings were found) -- callers use it purely for
-    surfacing "this token looks stale" feedback, never to fail the batch.
+    (jobs, error_message, excluded_season_count). error_message is None on
+    success (even if zero relevant postings were found) -- callers use it
+    purely for surfacing "this token looks stale" feedback, never to fail
+    the batch. excluded_season_count is how many otherwise-relevant
+    internship postings were dropped for naming an explicitly incompatible
+    season/year (e.g. "Summer 2026"), so the UI can show that filtering is
+    happening rather than making a source look emptier than it is.
     """
     company = source_config.get("company", "")
     board = source_config.get("board", "")
@@ -143,15 +178,26 @@ def fetch_company_jobs(source_config: dict) -> tuple:
             raw_jobs = _fetch_lever(token)
             parsed = [_parse_lever_posting(j, company) for j in raw_jobs]
         else:
-            return [], f"Unknown board type '{board}'"
+            return [], f"Unknown board type '{board}'", 0
     except (requests.RequestException, ValueError) as exc:
-        return [], f"{type(exc).__name__}: {exc}"
+        return [], f"{type(exc).__name__}: {exc}", 0
 
     relevant = [
         job for job in parsed
         if job["title"] and _looks_like_relevant_internship(job["title"], job["description"])
     ]
-    return relevant, None
+
+    kept = []
+    excluded_season_count = 0
+    for job in relevant:
+        season_status = classify_season(job["title"], job["description"])
+        if season_status == "incompatible":
+            excluded_season_count += 1
+            continue
+        job["season_status"] = season_status
+        kept.append(job)
+
+    return kept, None, excluded_season_count
 
 
 def fetch_all_board_jobs(sources: list = None) -> tuple:
@@ -160,16 +206,18 @@ def fetch_all_board_jobs(sources: list = None) -> tuple:
     network error for one company just gets recorded in `stats` and skipped.
 
     Returns (jobs, stats) where stats is a list of per-source dicts:
-      {"company": ..., "board": ..., "token": ..., "found": <int>, "error": <str|None>}
+      {"company": ..., "board": ..., "token": ..., "found": <int>,
+       "excluded_season": <int>, "error": <str|None>}
     so the UI/settings page can show exactly what happened on the last
-    refresh (including which tokens look like they need re-checking).
+    refresh (including which tokens look like they need re-checking, and
+    how many postings were filtered out for the wrong season).
     """
     sources = sources if sources is not None else BOARD_SOURCES
     all_jobs = []
     stats = []
 
     for source_config in sources:
-        jobs, error = fetch_company_jobs(source_config)
+        jobs, error, excluded_season = fetch_company_jobs(source_config)
         all_jobs.extend(jobs)
         stats.append(
             {
@@ -177,6 +225,7 @@ def fetch_all_board_jobs(sources: list = None) -> tuple:
                 "board": source_config.get("board", ""),
                 "token": source_config.get("token", ""),
                 "found": len(jobs),
+                "excluded_season": excluded_season,
                 "error": error,
             }
         )

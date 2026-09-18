@@ -9,6 +9,9 @@ differences ("Capital One" vs "Capital One ") don't create duplicates.
 """
 
 import re
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from src.config import TRACKING_QUERY_PARAMS
 
 
 def normalize_text(value: str) -> str:
@@ -22,13 +25,34 @@ def normalize_text(value: str) -> str:
 
 
 def normalize_url(url: str) -> str:
-    """Normalize a URL for comparison (strip trailing slash/query noise)."""
+    """
+    Normalize a URL for comparison: lowercase, strip a trailing slash, drop
+    the fragment, and remove only *known tracking* query parameters (see
+    TRACKING_QUERY_PARAMS) -- e.g. "?utm_source=twitter" is noise, but
+    "?gh_jid=12345" on a Greenhouse embed URL is often the only thing that
+    identifies *which* posting the link points to. Dropping every query
+    param unconditionally (the previous behavior) risked collapsing two
+    genuinely different postings into a single "duplicate" whenever a
+    board's only per-posting identifier lived in the query string. Any
+    remaining params are kept and sorted so equivalent URLs with params in
+    a different order still normalize to the same key.
+    """
     if not url:
         return ""
     url = url.strip().lower()
-    url = url.split("?")[0]  # drop query params (tracking params, etc.)
-    url = url.rstrip("/")
-    return url
+
+    parts = urlsplit(url)
+    kept_params = [
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if key not in TRACKING_QUERY_PARAMS
+    ]
+    kept_params.sort()
+    query = urlencode(kept_params)
+
+    path = parts.path.rstrip("/")
+    normalized = urlunsplit((parts.scheme, parts.netloc, path, query, ""))
+    return normalized
 
 
 def dedupe_key(job: dict) -> str:

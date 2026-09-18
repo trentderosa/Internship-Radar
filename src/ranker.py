@@ -15,7 +15,6 @@ OpenAI client directly.
 """
 
 import json
-import re
 
 from src.config import (
     OPENAI_API_KEY,
@@ -24,6 +23,7 @@ from src.config import (
     FALLBACK_SKILL_KEYWORDS,
     PREFERRED_LOCATION_KEYWORDS,
 )
+from src.text_match import matched_keywords
 
 _client = None
 if OPENAI_API_KEY:
@@ -35,23 +35,6 @@ if OPENAI_API_KEY:
         _client = None
 
 
-def _keyword_present(keyword: str, text: str) -> bool:
-    """
-    True if `keyword` appears in `text` as a whole word/phrase, not as a
-    substring of some longer word. Plain `keyword in text` matching has a
-    real bug here: "java" is a substring of "javascript", and "ai" is a
-    substring of ordinary words like "maintain", "domain", and "training",
-    so a posting with none of those skills would still rack up false
-    keyword hits and an inflated score. Bounding the match on both sides by
-    "not an alphanumeric character" (rather than regex \\b, which doesn't
-    play well with symbol-containing keywords like "c++" or "c#") fixes
-    both cases while still matching multi-word phrases like "machine
-    learning" correctly.
-    """
-    pattern = r"(?<![a-z0-9])" + re.escape(keyword) + r"(?![a-z0-9])"
-    return re.search(pattern, text) is not None
-
-
 def _location_is_preferred(location: str) -> bool:
     loc = (location or "").lower()
     return any(marker in loc for marker in PREFERRED_LOCATION_KEYWORDS)
@@ -61,7 +44,7 @@ def _fallback_score(job: dict) -> dict:
     """Keyword-overlap scoring used when OpenAI isn't available."""
     text = f"{job.get('title', '')} {job.get('description', '')}".lower()
 
-    matched = [kw for kw in FALLBACK_SKILL_KEYWORDS if _keyword_present(kw, text)]
+    matched = matched_keywords(FALLBACK_SKILL_KEYWORDS, text)
 
     # Simple, transparent formula: each matched keyword is worth a few
     # points, capped at 100 before the location bonus below. Gives a

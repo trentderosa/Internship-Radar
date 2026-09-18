@@ -29,6 +29,7 @@ JOB_COLUMNS = [
     "source",
     "description",
     "posted_at",
+    "source_updated_at",
     "discovered_at",
     "last_seen_at",
     "status",
@@ -40,17 +41,33 @@ JOB_COLUMNS = [
     "viewed_at",
     "applied_at",
     "dedupe_key",
+    "season_status",
 ]
 
 # Columns that may be missing on a database created by an older version of
 # the app. Each entry is (column_name, SQL type/default) used to build an
 # ALTER TABLE ... ADD COLUMN statement. Migration is additive-only -- it
 # never drops or rewrites existing data.
+#
+# Four distinct dates/timestamps are tracked on each job, and it matters
+# that they stay distinct:
+#   - posted_at         -- genuine original publication date, when the
+#                           source actually provides one (never a source's
+#                           "last updated" field -- see board_apis.py).
+#   - source_updated_at  -- when the source system says the listing itself
+#                           was last modified (e.g. Greenhouse's updated_at).
+#   - discovered_at      -- when *this app* first saw the posting (set once,
+#                           on insert, never changed).
+#   - last_seen_at       -- when *this app* most recently saw the posting
+#                           still listed by its source (bumped on every
+#                           refresh that finds it again).
 _MIGRATION_COLUMNS = [
     ("viewed", "INTEGER NOT NULL DEFAULT 0"),
     ("viewed_at", "TEXT"),
     ("applied_at", "TEXT"),
     ("posted_at", "TEXT"),
+    ("source_updated_at", "TEXT"),
+    ("season_status", "TEXT"),
 ]
 
 
@@ -84,6 +101,7 @@ def init_db() -> None:
                 source         TEXT,
                 description    TEXT,
                 posted_at      TEXT,
+                source_updated_at TEXT,
                 discovered_at  TEXT NOT NULL,
                 last_seen_at   TEXT NOT NULL,
                 status         TEXT NOT NULL DEFAULT 'New',
@@ -94,7 +112,8 @@ def init_db() -> None:
                 viewed         INTEGER NOT NULL DEFAULT 0,
                 viewed_at      TEXT,
                 applied_at     TEXT,
-                dedupe_key     TEXT UNIQUE
+                dedupe_key     TEXT UNIQUE,
+                season_status  TEXT
             )
             """
         )
@@ -191,10 +210,10 @@ def upsert_jobs(jobs: list) -> int:
                 """
                 INSERT INTO jobs (
                     company, title, location, url, source, description,
-                    posted_at, discovered_at, last_seen_at, status, score,
-                    ai_summary, matched_skills, notes,
-                    viewed, viewed_at, applied_at, dedupe_key
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    posted_at, source_updated_at, discovered_at, last_seen_at,
+                    status, score, ai_summary, matched_skills, notes,
+                    viewed, viewed_at, applied_at, dedupe_key, season_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.get("company", "").strip(),
@@ -204,6 +223,7 @@ def upsert_jobs(jobs: list) -> int:
                     job.get("source", "").strip(),
                     job.get("description", "").strip(),
                     (job.get("posted_at") or "").strip(),
+                    (job.get("source_updated_at") or "").strip(),
                     now,
                     now,
                     DEFAULT_STATUS,
@@ -215,6 +235,7 @@ def upsert_jobs(jobs: list) -> int:
                     None,
                     None,
                     key,
+                    (job.get("season_status") or "unconfirmed").strip(),
                 ),
             )
             new_count += 1
